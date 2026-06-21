@@ -1,46 +1,59 @@
 import { Scene } from 'phaser';
 
-export class Preloader extends Scene
-{
-    constructor ()
-    {
+export class Preloader extends Scene {
+    constructor() {
         super('Preloader');
     }
 
-    init ()
-    {
-        //  We loaded this image in our Boot Scene, so we can display it here
-        this.add.image(512, 384, 'background');
+    init() {
+        const w = this.scale.width;
+        const h = this.scale.height;
 
-        //  A simple progress bar. This is the outline of the bar.
-        this.add.rectangle(512, 384, 468, 32).setStrokeStyle(1, 0xffffff);
+        // Dark background
+        this.add.rectangle(w / 2, h / 2, w, h, 0x0b0e14);
 
-        //  This is the progress bar itself. It will increase in size from the left based on the % of progress.
-        const bar = this.add.rectangle(512-230, 384, 4, 28, 0xffffff);
+        // Brand text
+        this.add.text(w / 2, h / 2 - 80, 'EUPHORIA', {
+            fontFamily: '"Orbitron", "Arial Black", sans-serif',
+            fontSize: Math.min(48, w * 0.08),
+            color: '#00e5ff',
+            letterSpacing: 8
+        }).setOrigin(0.5);
 
-        //  Use the 'progress' event emitted by the LoaderPlugin to update the loading bar
+        this.add.text(w / 2, h / 2 - 40, 'TRADE', {
+            fontFamily: '"Orbitron", "Arial", sans-serif',
+            fontSize: Math.min(18, w * 0.03),
+            color: '#ffffff66',
+            letterSpacing: 12
+        }).setOrigin(0.5);
+
+        // Progress bar bg
+        const barW = Math.min(300, w * 0.7);
+        this.add.rectangle(w / 2, h / 2 + 40, barW, 4, 0x222a3f);
+
+        // Progress bar fill
+        this.progressBar = this.add.rectangle(w / 2 - barW / 2, h / 2 + 40, 0, 4, 0x00e5ff).setOrigin(0, 0.5);
+        this.barWidth = barW;
+
+        // Loading text
+        this.loadingText = this.add.text(w / 2, h / 2 + 65, 'LOADING...', {
+            fontFamily: 'Arial',
+            fontSize: 12,
+            color: '#ffffff44',
+            letterSpacing: 4
+        }).setOrigin(0.5);
+
         this.load.on('progress', (progress) => {
-
-            //  Update the progress bar (our bar is 464px wide, so 100% = 464px)
-            bar.width = 4 + (460 * progress);
-
+            this.progressBar.width = this.barWidth * progress;
         });
     }
 
-    preload ()
-    {
-        //  Load the assets for the game - Replace with your own assets
+    preload() {
         this.load.setPath('assets');
-
         this.load.image('logo', 'logo.png');
     }
 
-    create ()
-    {
-        //  When all the assets have loaded, it's often worth creating global objects here that the rest of the game can use.
-        //  For example, you can define global animations here, so we can use them in other scenes.
-
-        //  Move to the MainMenu. You could also swap this for a Scene Transition, such as a camera fade.
+    create() {
         this.scene.start('MainMenu');
     }
 }
