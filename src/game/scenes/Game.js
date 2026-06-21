@@ -35,11 +35,11 @@ export class Game extends Scene {
 
         // Zoom scale variables defining visual space scaling
         this.basePixelsPerSecond = 12; // Base horizontal scale factor (time axis)
-        this.basePixelsPerDollar = 150; // Base vertical scale factor (price axis)
+        this.basePixelsPerDollar = 240; // Base vertical scale factor (price axis) — matched to timeInterval for square cells
         this.zoomTarget = 1;           // Target zoom level to smoothly transition towards
         this.currentZoom = 1;          // Active zoom level interpolating towards zoomTarget
         this.minZoom = 0.7;            // Minimum allowed zoom out level (keeps cells readable)
-        this.maxZoom = 2.0;            // Maximum allowed zoom in level
+        this.maxZoom = 1.9;            // Maximum allowed zoom in level
 
         // Viewport camera/navigation state
         this.viewTime = Date.now();       // Current time anchor for the x-axis center
@@ -227,12 +227,12 @@ export class Game extends Scene {
         // Generate text pool to display cell multiplier texts (e.g. "1.5x") efficiently
         // Pooling text objects prevents constant garbage collection allocation spikes
         this._textPool = [];
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < 200; i++) {
             this._textPool.push(this.add.text(0, 0, '', { 
                 fontFamily: 'Arial', 
-                fontSize: 17, 
+                fontSize: 19, 
                 color: '#ffffffff' 
-            }).setOrigin(1, 1).setMask(this.chartMask).setVisible(false));
+            }).setOrigin(1, 1).setDepth(100).setMask(this.chartMask).setVisible(false));
         }
 
         // ── Axis Label Pools ────────────────────────────────────────────────
@@ -382,16 +382,29 @@ export class Game extends Scene {
         const pointer = this.input.activePointer;
         let hoveredCell = null;
 
+        // Betable area depth constraints
+        const xDepth = 18; // Max columns forward that are fully betable (with multiplier + hover)
+        const yDepth = 20; // Max rows up and down from the current price box
+
+        // Determine the price box that currently contains the live price
+        const currentPriceBox = Math.floor(this.currentPrice / priceInterval) * priceInterval;
+
         // Iterate columns starting only from the current time forward (preventing betting on past intervals)
         for (let t = Math.max(firstTime, Math.ceil(this.t / timeInterval) * timeInterval); t <= lastTime; t += timeInterval) {
             const isBetable = (t - this.t) > timeInterval;
 
-            let alpha = 0.6;
+            // Compute absolute column offset from the current time (scroll-independent)
+            const colIndex = Math.round((t - this.t) / timeInterval);
+
+            // Check if this column is within the X depth for full betting features
+            const isWithinXDepth = colIndex <= xDepth;
+
+            let alpha = 0.8;
             if (isBetable) {
                 const timeToCutoff = (t - timeInterval) - this.t;
                 if (timeToCutoff <= 2000) {
                     const blinkProgress = timeToCutoff / 2000;
-                    alpha = blinkProgress * (0.35 + 0.25 * Math.cos(blinkProgress * 4 * Math.PI));
+                    alpha = blinkProgress * (0.45 + 0.25 * Math.cos(blinkProgress * 4 * Math.PI));
                 }
             } else {
                 alpha = 0;
@@ -403,13 +416,20 @@ export class Game extends Scene {
                 const w = getX(t + timeInterval) - x;
                 const h = getY(p) - y;
 
-                // Base cell borders: Always draw highlighted rounded borders for all valid future betable blocks
+                // Calculate row distance from the current price box
+                const rowOffset = Math.round((p - currentPriceBox) / priceInterval);
+                const isWithinYDepth = Math.abs(rowOffset) <= yDepth;
+
+                // A cell is fully betable only if within both X and Y depth
+                const isFullyBetable = isBetable && isWithinXDepth && isWithinYDepth;
+
+                // Base cell borders: draw for all visible future cells
                 if (alpha > 0) {
                     ug.lineStyle(1, C.CELL_BG, alpha);
                     ug.strokeRoundedRect(x + 2, y + 2, w - 4, h - 4, 6);
 
-                    // Multiplier label rendering: retrieve label object from pool and place inside cell
-                    if (textIdx < this._textPool.length) {
+                    // Multiplier label: only render within the fully betable area
+                    if (isFullyBetable && textIdx < this._textPool.length) {
                         const txt = this._textPool[textIdx++];
                         // Calculate a deterministic mock payout multiplier based on price coordinates
                         const mult = (100 - ((p % 5) * 10) + ((t % 60000) / 1000)).toFixed(1);
@@ -418,7 +438,8 @@ export class Game extends Scene {
                 }
 
                 // Check if user cursor is hovering directly inside this cell's bounding area
-                const isHovered = isBetable && pointer.x >= x && pointer.x < x + w && pointer.y >= y && pointer.y < y + h;
+                // Only allow hover/click within the fully betable area
+                const isHovered = isFullyBetable && pointer.x >= x && pointer.x < x + w && pointer.y >= y && pointer.y < y + h;
 
                 // Draw solid hover fill overlay if mouse pointer resides inside cell boundaries
                 if (isHovered && x < b.x + b.w && y > b.y) {
