@@ -201,12 +201,6 @@ export class Game extends Scene {
         const W = this.scale.width;
         const H = this.scale.height;
 
-        // Render the overall game screen background gradient
-        const bg = this.add.graphics();
-        bg.fillGradientStyle(0x0b0e14, 0x0b0e14, 0x151924, 0x151924, 1);
-        bg.fillRect(0, 0, W, H);
-        
-
         // Chart Area boundary coordinates spanning the full viewport canvas
         this.chartBounds = {
             x: 0,
