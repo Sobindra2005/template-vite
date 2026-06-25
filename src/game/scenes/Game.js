@@ -177,8 +177,8 @@ export class Game extends Scene {
 
         // Simulate Real-time Price Fluctuations (Random Walk)
         // 15% probability per frame to step the price up or down
-        if (Math.random() < 0.15) {
-            this.currentPrice += PhaserMath.FloatBetween(-0.02, 0.02);
+        if (Math.random() < 0.05) {
+            this.currentPrice += PhaserMath.FloatBetween(-0.04, 0.05);
             this.history.push({ t: this.t, p: this.currentPrice });
             // Prune history buffer to keep memory footprints low
             if (this.history.length > 2000) this.history.shift();
