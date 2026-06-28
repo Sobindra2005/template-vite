@@ -1,4 +1,5 @@
 import { Scene, Math as PhaserMath } from 'phaser';
+import { getBachelierMultiplier } from '../utils/options.js';
 
 // Global color and styling configuration constants
 const C = {
@@ -33,13 +34,36 @@ export class Game extends Scene {
         this.history = []; // Holds historical { t: timestamp, p: price } points
         this.bets = [];    // Array of bets placed by the user: { t, p, amount }
 
-        // Zoom scale variables defining visual space scaling
-        this.basePixelsPerSecond = 12; // Base horizontal scale factor (time axis)
-        this.basePixelsPerDollar = 240; // Base vertical scale factor (price axis) — matched to timeInterval for square cells
-        this.zoomTarget = 1;           // Target zoom level to smoothly transition towards
-        this.currentZoom = 1;          // Active zoom level interpolating towards zoomTarget
-        this.minZoom = 0.7;            // Minimum allowed zoom out level (keeps cells readable)
-        this.maxZoom = 1.9;            // Maximum allowed zoom in level
+        // Parameters calibrated to simulate Bachelier options pricing (Arithmetic Brownian Motion)
+        // relative to the game's actual real-time price updates (3% probability per frame, U(-0.08, 0.08))
+        this.volatility = 0.062; // Absolute volatility in dollars per root-second
+        this.driftRate = 0.0    // Symmetric walk has 0 drift
+
+        // ── Grid interval config ─────────────────────────────────────────────
+        // These define the spacing of the betting grid and price axis labels.
+        // Changing them here automatically keeps the cell aspect ratio correct.
+        this.timeInterval = 5000; // ms per column (e.g. 5000 = one column every 5 seconds)
+        this.priceInterval = 0.5;  // $ per row   (e.g. 0.5 = one row every $0.50)
+
+        // ── Single source-of-truth cell size ─────────────────────────────────
+        // Set this ONE value to control how big each betting cell is on screen at zoom 1.
+        // Both scale factors are derived automatically so cells are always square.
+        //
+        //   basePixelsPerSecond = cellSizePx / (timeInterval / 1000)
+        //   basePixelsPerDollar = cellSizePx / priceInterval
+        //
+        //   → cellWidth  = (timeInterval / 1000) × pixelsPerSecond = cellSizePx  ✓
+        //   → cellHeight = priceInterval × pixelsPerDollar         = cellSizePx  ✓
+        this.cellSizePx = 120; // target cell size in pixels at zoom = 1
+
+        this.basePixelsPerSecond = this.cellSizePx / (this.timeInterval / 1000);
+        this.basePixelsPerDollar = this.cellSizePx / this.priceInterval;
+
+        // Zoom scale variables
+        this.zoomTarget = 1;  // Target zoom level to smoothly transition towards
+        this.currentZoom = 1; // Active zoom level interpolating towards zoomTarget
+        this.minZoom = 0.5;   // Minimum allowed zoom out level (keeps cells readable)
+        this.maxZoom = 1.9;   // Maximum allowed zoom in level
 
         // Viewport camera/navigation state
         this.viewTime = Date.now();       // Current time anchor for the x-axis center
@@ -47,6 +71,14 @@ export class Game extends Scene {
         this.isAutoFollowing = true;      // If true, keeps screen centered on the latest price tick
         this.isDragging = false;          // True when user is actively clicking and dragging the viewport
         this.lastClickTime = 0;           // Tracking click intervals to detect double-clicks
+
+        // ── Multiplier text update throttling ────────────────────────────────
+        // Multiplier values are expensive to recalculate every frame, so we only
+        // update them when the price changes OR when the fallback interval fires.
+        this._lastMultiplierUpdateTime = 0;  // Timestamp of the last full multiplier refresh
+        this._multiplierRefreshInterval = 100; // ms between forced refreshes when price is stable
+        this._priceUpdatedThisFrame = false;   // Set true when a new price tick is emitted this frame
+        this._multiplierCache = new Map();     // key: "col:row" → computed multiplier value
 
         // Active running time variable initialized to current system time
         this.t = this.viewTime;
@@ -72,6 +104,79 @@ export class Game extends Scene {
         // Build the basic graphics layer container and price/balance UI widgets
         this._buildUI();
 
+        this.EventIntialize();
+        // Handle Responsive Window Resizing
+        // Safely recreates all UI elements after a slight debounce to prevent rendering artifacts
+        let resizeTimer;
+        const resizeHandler = ({ width, height }) => {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                this.children.removeAll(true); // Clear all existing GameObjects from Scene list
+                this.tweens.killAll();         // Terminate ongoing UI animations
+                this._buildUI();               // Rebuild UI components for the new dimensions
+            }, 150);
+        };
+        this.scale.on('resize', resizeHandler);
+        // Clean up resize listener on scene shutdown to prevent memory leaks
+        this.events.once('shutdown', () => this.scale.off('resize', resizeHandler));
+
+        // Create diagnostic FPS counter text in the upper left corner
+        this.fpsText = this.add.text(10, 10, 'FPS: 0', {
+            fontSize: '20px',
+            color: '#ffffff'
+        });
+    }
+
+    
+    /**
+     * Main Game Update Loop
+     * Runs every frame. Updates FPS counter, interpolates zoom levels, ticks time,
+     * runs real-time price simulation, and triggers frame redraws.
+     */
+    update(time, delta) {
+        // Display real-time active loops per second (FPS)
+        this.fpsText.setText(
+            `FPS: ${Math.round(this.game.loop.actualFps)}`
+        );
+
+        // Wait until UI is built and boundary coordinates are established
+        if (!this.chartBounds) return;
+
+        // Smooth zoom transition: interpolate currentZoom towards zoomTarget using a lerp coefficient
+        this.currentZoom += (this.zoomTarget - this.currentZoom) * 0.15;
+        this.pixelsPerSecond = this.basePixelsPerSecond * this.currentZoom;
+        this.pixelsPerDollar = this.basePixelsPerDollar * this.currentZoom;
+
+        // Advance simulation time (delta is time in ms elapsed since last frame)
+        this.t += delta;
+
+        // If auto-following, automatically center the viewport on current time and lerp vertical price position
+        if (this.isAutoFollowing) {
+            this.viewTime = this.t;
+            this.viewPrice += (this.currentPrice - this.viewPrice) * 0.03; // Smooth vertical stabilization
+        }
+
+        // Simulate Real-time Price Fluctuations (Random Walk)
+        this._priceUpdatedThisFrame = false;
+        if (Math.random() < 0.03) {
+            this.currentPrice += PhaserMath.FloatBetween(-0.04, 0.04);
+            this.history.push({ t: this.t, p: this.currentPrice });
+            this._priceUpdatedThisFrame = true;
+            // Prune history buffer to keep memory footprints low
+            if (this.history.length > 2000) this.history.shift();
+        } else if (this.history.length > 0) {
+            // Keep the tail of the line updated with the exact current timestamp to make drawing seamless
+            this.history[this.history.length - 1].t = this.t;
+            this.history[this.history.length - 1].p = this.currentPrice;
+        }
+
+        // Trigger redrawing of the grid system, betting boxes, and chart line paths
+        this._drawChartAndGrid();
+
+    }
+
+    EventIntialize() {
+
         // Register Mouse Wheel listener to support zooming in and out of the chart
         this.input.on('wheel', (pointer, gameObjects, deltaX, deltaY, deltaZ) => {
             // Negative deltaY means scroll up (zoom in), positive means scroll down (zoom out)
@@ -85,6 +190,11 @@ export class Game extends Scene {
             this.dragStartX = pointer.x;
             this.dragStartY = pointer.y;
             this.isDragging = false; // Reset drag state on click
+
+            // Snapshot the cell under the pointer at press time so we can compare on release
+            this._pointerDownCell = this._hoveredCell
+                ? { t: this._hoveredCell.t, p: this._hoveredCell.p }
+                : null;
 
             const now = Date.now();
             // Detect double-click if time elapsed since last click is under 300ms
@@ -120,76 +230,19 @@ export class Game extends Scene {
             }
         });
 
-        // Register Pointer Up listener to release drag state with a slight debounce delay
+        // Register Pointer Up listener — place bet only when pointer lifts inside the same cell it pressed
         this.input.on('pointerup', () => {
+            // A valid tap: no drag occurred AND the pointer released over the same cell it pressed on
+            if (!this.isDragging && this._pointerDownCell && this._hoveredCell &&
+                this._pointerDownCell.t === this._hoveredCell.t &&
+                this._pointerDownCell.p === this._hoveredCell.p) {
+                this._placeBet(this._hoveredCell.t, this._hoveredCell.p);
+            }
+            // Always clear the pressed-cell snapshot and release drag lock
+            this._pointerDownCell = null;
             setTimeout(() => { this.isDragging = false; }, 50);
         });
 
-        // Handle Responsive Window Resizing
-        // Safely recreates all UI elements after a slight debounce to prevent rendering artifacts
-        let resizeTimer;
-        const resizeHandler = ({ width, height }) => {
-            if (resizeTimer) clearTimeout(resizeTimer);
-            resizeTimer = setTimeout(() => {
-                this.children.removeAll(true); // Clear all existing GameObjects from Scene list
-                this.tweens.killAll();         // Terminate ongoing UI animations
-                this._buildUI();               // Rebuild UI components for the new dimensions
-            }, 150);
-        };
-        this.scale.on('resize', resizeHandler);
-        // Clean up resize listener on scene shutdown to prevent memory leaks
-        this.events.once('shutdown', () => this.scale.off('resize', resizeHandler));
-
-        // Create diagnostic FPS counter text in the upper left corner
-        this.fpsText = this.add.text(10, 10, 'FPS: 0', {
-            fontSize: '20px',
-            color: '#ffffff'
-        });
-    }
-
-    /**
-     * Main Game Update Loop
-     * Runs every frame. Updates FPS counter, interpolates zoom levels, ticks time,
-     * runs real-time price simulation, and triggers frame redraws.
-     */
-    update(time, delta) {
-        // Display real-time active loops per second (FPS)
-        this.fpsText.setText(
-            `FPS: ${Math.round(this.game.loop.actualFps)}`
-        );
-        
-        // Wait until UI is built and boundary coordinates are established
-        if (!this.chartBounds) return;
-
-        // Smooth zoom transition: interpolate currentZoom towards zoomTarget using a lerp coefficient
-        this.currentZoom += (this.zoomTarget - this.currentZoom) * 0.15;
-        this.pixelsPerSecond = this.basePixelsPerSecond * this.currentZoom;
-        this.pixelsPerDollar = this.basePixelsPerDollar * this.currentZoom;
-
-        // Advance simulation time (delta is time in ms elapsed since last frame)
-        this.t += delta;
-
-        // If auto-following, automatically center the viewport on current time and lerp vertical price position
-        if (this.isAutoFollowing) {
-            this.viewTime = this.t;
-            this.viewPrice += (this.currentPrice - this.viewPrice) * 0.03; // Smooth vertical stabilization
-        }
-
-        // Simulate Real-time Price Fluctuations (Random Walk)
-        // 15% probability per frame to step the price up or down
-        if (Math.random() < 0.05) {
-            this.currentPrice += PhaserMath.FloatBetween(-0.04, 0.05);
-            this.history.push({ t: this.t, p: this.currentPrice });
-            // Prune history buffer to keep memory footprints low
-            if (this.history.length > 2000) this.history.shift();
-        } else if (this.history.length > 0) {
-            // Keep the tail of the line updated with the exact current timestamp to make drawing seamless
-            this.history[this.history.length - 1].t = this.t;
-            this.history[this.history.length - 1].p = this.currentPrice;
-        }
-
-        // Trigger redrawing of the grid system, betting boxes, and chart line paths
-        this._drawChartAndGrid();
     }
 
     /**
@@ -221,11 +274,11 @@ export class Game extends Scene {
         // Generate text pool to display cell multiplier texts (e.g. "1.5x") efficiently
         // Pooling text objects prevents constant garbage collection allocation spikes
         this._textPool = [];
-        for (let i = 0; i < 200; i++) {
-            this._textPool.push(this.add.text(0, 0, '', { 
-                fontFamily: 'Arial', 
-                fontSize: 19, 
-                color: '#ffffffff' 
+        for (let i = 0; i < 300; i++) {
+            this._textPool.push(this.add.text(0, 0, '', {
+                fontFamily: 'Arial',
+                fontSize: 19,
+                color: '#ffffffff'
             }).setOrigin(1, 1).setDepth(100).setMask(this.chartMask).setVisible(false));
         }
 
@@ -273,7 +326,7 @@ export class Game extends Scene {
         cg.clear();
         ug.clear();
         this._axisLabelGraphics.clear();
-        
+
         // Hide all pooled texts by default; they will be turned on selectively below
         this._textPool.forEach(t => t.setVisible(false));
         this._timeLabelPool.forEach(t => t.setVisible(false));
@@ -292,8 +345,8 @@ export class Game extends Scene {
         // 1. DRAW BACKGROUND GRID
         gg.lineStyle(1, C.GRID, 0.4);
 
-        // Draw vertical columns spaced every 10 seconds (10,000 milliseconds)
-        const timeInterval = 10000;
+        // Draw vertical columns — interval is controlled by this.timeInterval set in init()
+        const timeInterval = this.timeInterval;
         // Find timestamps matching grid boundaries just outside the left and right viewport limits
         const firstTime = Math.floor((this.viewTime - (dotX - b.x) / this.pixelsPerSecond * 1000) / timeInterval) * timeInterval;
         const lastTime = Math.ceil((this.viewTime + (b.w - (dotX - b.x)) / this.pixelsPerSecond * 1000) / timeInterval) * timeInterval;
@@ -301,9 +354,9 @@ export class Game extends Scene {
         // Helper: format a ms timestamp as HH:MM:SS
         const fmtTime = (ms) => {
             const d = new Date(ms);
-            return d.getHours().toString().padStart(2,'0') + ':'
-                 + d.getMinutes().toString().padStart(2,'0') + ':'
-                 + d.getSeconds().toString().padStart(2,'0');
+            return d.getHours().toString().padStart(2, '0') + ':'
+                + d.getMinutes().toString().padStart(2, '0') + ':'
+                + d.getSeconds().toString().padStart(2, '0');
         };
 
         for (let t = firstTime; t <= lastTime; t += timeInterval) {
@@ -331,8 +384,8 @@ export class Game extends Scene {
             }
         }
 
-        // Draw horizontal rows spaced every $0.5
-        const priceInterval = 0.5;
+        // Draw horizontal rows — interval is controlled by this.priceInterval set in init()
+        const priceInterval = this.priceInterval;
         const visiblePriceRange = (b.h / this.pixelsPerDollar);
         const firstPrice = Math.floor((this.viewPrice - visiblePriceRange / 2) / priceInterval) * priceInterval;
         const lastPrice = Math.ceil((this.viewPrice + visiblePriceRange / 2) / priceInterval) * priceInterval;
@@ -355,7 +408,7 @@ export class Game extends Scene {
                     alg.fillRoundedRect(pillX, pillY, pillW, pillH, 4);
                     alg.lineStyle(1, C.GRID, 0.6);
                     alg.strokeRoundedRect(pillX, pillY, pillW, pillH, 4);
-                    lbl.setPosition(b.x + b.w - pillW , y).setText(`$${p.toFixed(1)}`).setOrigin(0, 0.5).setVisible(true);
+                    lbl.setPosition(b.x + b.w - pillW, y).setText(`$${p.toFixed(1)}`).setOrigin(0, 0.5).setVisible(true);
                 }
             }
         }
@@ -377,7 +430,7 @@ export class Game extends Scene {
         let hoveredCell = null;
 
         // Betable area depth constraints
-        const xDepth = 18; // Max columns forward that are fully betable (with multiplier + hover)
+        const xDepth = 26; // Max columns forward that are fully betable (with multiplier + hover)
         const yDepth = 20; // Max rows up and down from the current price box
 
         // Determine the price box that currently contains the live price
@@ -425,9 +478,47 @@ export class Game extends Scene {
                     // Multiplier label: only render within the fully betable area
                     if (isFullyBetable && textIdx < this._textPool.length) {
                         const txt = this._textPool[textIdx++];
-                        // Calculate a deterministic mock payout multiplier based on price coordinates
-                        const mult = (100 - ((p % 5) * 10) + ((t % 60000) / 1000)).toFixed(1);
-                        txt.setPosition(x + w - 4, y + h - 4).setText(`${mult}x`).setVisible(true).setAlpha(alpha);
+                        const cacheKey = `${colIndex}:${rowOffset}`;
+
+                        // Decide whether to recompute multiplier values this frame:
+                        //  • Always refresh when the graph emitted a new price tick.
+                        //  • Also refresh when the fallback interval has elapsed (price stable).
+                        const now = this.t;
+                        const shouldRefresh = this._priceUpdatedThisFrame ||
+                            (now - this._lastMultiplierUpdateTime) >= this._multiplierRefreshInterval;
+
+                        if (shouldRefresh) {
+                            // Grid centering technique to enforce perfect symmetry and prevent boundary jitter
+                            const S0 = Math.floor(this.currentPrice / priceInterval) * priceInterval + priceInterval / 2;
+                            const K1 = p;
+                            const K2 = p + priceInterval;
+                            const T_expiry = (t - this.t) / 1000; // time to expiry in seconds
+                            const multiplierVal = getBachelierMultiplier(
+                                S0,
+                                K1,
+                                K2,
+                                T_expiry,
+                                this.driftRate,
+                                this.volatility,
+                                0.2, // 10% house margin
+                                100.0 // 100x max payout cap
+                            );
+                            const isNearestAdjacent = rowOffset === 1 || rowOffset === -1 || rowOffset === 0;
+                            const formatted = isNearestAdjacent
+                                ? `${multiplierVal.toFixed(2)}x`
+                                : `${multiplierVal.toFixed(1)}x`;
+                            // Store the formatted string so we can reuse it on non-refresh frames
+                            this._multiplierCache.set(cacheKey, formatted);
+                            txt.setText(formatted);
+                        } else {
+                            // Reuse the last computed label — avoids setText overhead entirely
+                            const cached = this._multiplierCache.get(cacheKey);
+                            if (cached !== undefined && txt.text !== cached) {
+                                txt.setText(cached);
+                            }
+                        }
+
+                        txt.setPosition(x + w - 4, y + h - 4).setVisible(true).setAlpha(alpha);
                     }
                 }
 
@@ -440,6 +531,14 @@ export class Game extends Scene {
                     hoveredCell = { t, p, x, y, w, h };
                     ug.fillStyle(C.CELL_BG, 0.1 * (alpha / 0.6));
                     ug.fillRoundedRect(x + 2, y + 2, w - 4, h - 4, 6);
+                }
+
+                // Highlight the cell that was pressed-down on (visual press feedback)
+                if (this._pointerDownCell &&
+                    this._pointerDownCell.t === t && this._pointerDownCell.p === p &&
+                    pointer.isDown && !this.isDragging) {
+                    ug.lineStyle(2, C.ACCENT, 0.6);
+                    ug.strokeRoundedRect(x + 2, y + 2, w - 4, h - 4, 6);
                 }
 
                 // Render placed bets: Check if current cell coordinates match a stored user bet
@@ -460,54 +559,125 @@ export class Game extends Scene {
             }
         }
 
-        // Process grid interaction clicks (when mouse pointer is down and hovering over an interactive cell)
-        if (pointer.isDown && hoveredCell && !this._isClicking && !this.isDragging) {
-            this._isClicking = true; // Lock clicking state to trigger exactly once per press
-            this._placeBet(hoveredCell.t, hoveredCell.p);
-        } else if (!pointer.isDown) {
-            this._isClicking = false; // Reset lock when user releases touch/click
+        // After iterating all cells: if a full refresh happened this frame, record the timestamp
+        // so the fallback interval is correctly measured from the last actual recalculation.
+        if (this._priceUpdatedThisFrame ||
+            (this.t - this._lastMultiplierUpdateTime) >= this._multiplierRefreshInterval) {
+            this._lastMultiplierUpdateTime = this.t;
         }
+
+        // Publish the currently hovered cell so pointerdown/pointerup handlers can read it
+        this._hoveredCell = hoveredCell || null;
 
         // 3. DRAW THE CHART LINE & SHADING
         if (this.history.length > 0) {
-            let lastX = 0, lastY = 0;
-            let firstX = getX(this.history[0].t);
+            const chartLeft  = b.x;
+            const chartRight = b.x + b.w;
+            const chartBottom = b.y + b.h;
 
-            // Shading: Draw filled polygon under the line graph
+            // Build the list of screen-space points for all history entries
+            const pts = this.history.map(pt => ({ x: getX(pt.t), y: getY(pt.p) }));
+
+            // Find the first point that is at or just before the left edge of the viewport,
+            // and the last point that is at or just after the right edge.
+            // This lets us interpolate the exact x-edge crossings so the fill polygon
+            // never anchors far off-screen (which caused the diagonal triangular glitch).
+            let startIdx = 0;
+            for (let i = 0; i < pts.length - 1; i++) {
+                if (pts[i + 1].x >= chartLeft) { startIdx = i; break; }
+            }
+            let endIdx = pts.length - 1;
+            for (let i = pts.length - 1; i > 0; i--) {
+                if (pts[i - 1].x <= chartRight) { endIdx = i; break; }
+            }
+
+            // Helper: linearly interpolate y at a given x between two points
+            const interpY = (p0, p1, targetX) => {
+                if (p1.x === p0.x) return p0.y;
+                const t = (targetX - p0.x) / (p1.x - p0.x);
+                return p0.y + t * (p1.y - p0.y);
+            };
+
+            // Clamp y so fill polygon vertices never escape the chart bounds.
+            // Without this, points that are scrolled off the top or bottom of the screen
+            // produce V-shaped / funnel fill artifacts because the polygon bottom anchors
+            // are always at chartBottom while mid-curve vertices can be outside the canvas.
+            const clampY = (y) => Math.max(b.y, Math.min(chartBottom, y));
+
+            // Clip entry point: interpolate where the line crosses the left viewport edge
+            const entryX = Math.max(chartLeft, pts[startIdx].x);
+            const entryY = (pts[startIdx].x < chartLeft && startIdx + 1 <= endIdx)
+                ? interpY(pts[startIdx], pts[startIdx + 1], chartLeft)
+                : pts[startIdx].y;
+
+            // Clip exit point: interpolate where the line crosses the right viewport edge
+            const exitX  = Math.min(chartRight, pts[endIdx].x);
+            const exitY  = (pts[endIdx].x > chartRight && endIdx - 1 >= startIdx)
+                ? interpY(pts[endIdx - 1], pts[endIdx], chartRight)
+                : pts[endIdx].y;
+
+            // Shading: Draw filled polygon under the visible segment of the line graph.
+            // All y-values are clamped to [b.y, chartBottom] so the polygon never creates
+            // diagonal artifacts when the curve is scrolled past the top or bottom edge.
             cg.beginPath();
-            cg.moveTo(firstX, b.y + b.h); // Bottom anchor at first point
-            this.history.forEach((pt) => {
-                const x = getX(pt.t);
-                const y = getY(pt.p);
-                cg.lineTo(x, y);
-                lastX = x;
-                lastY = y;
-            });
-            cg.lineTo(lastX, b.y + b.h); // Bottom anchor at last point
+            cg.moveTo(entryX, chartBottom);              // bottom-left anchor
+            cg.lineTo(entryX, clampY(entryY));           // up to clamped line entry
+            for (let i = startIdx + 1; i <= endIdx; i++) {
+                const px = Math.min(pts[i].x, chartRight);
+                const py = (pts[i].x > chartRight) ? exitY : pts[i].y;
+                cg.lineTo(px, clampY(py));               // follow curve, y clamped
+                if (pts[i].x >= chartRight) break;
+            }
+            cg.lineTo(exitX, chartBottom);               // bottom-right anchor
             cg.closePath();
-            cg.fillStyle(C.ACCENT, 0.08); // Semi-transparent blue fill
+            cg.fillStyle(C.ACCENT, 0.08);
             cg.fillPath();
 
             // Glow line: thick semi-transparent backing line simulating a neon tube glow
             cg.lineStyle(8, C.ACCENT, 0.15);
             cg.beginPath();
-            this.history.forEach((pt, i) => {
-                const x = getX(pt.t);
-                const y = getY(pt.p);
-                if (i === 0) cg.moveTo(x, y);
-                else cg.lineTo(x, y);
-            });
+            let glowStarted = false;
+            for (let i = 0; i < pts.length; i++) {
+                const px = pts[i].x;
+                const py = pts[i].y;
+                if (px < chartLeft) continue;
+                if (!glowStarted) {
+                    // Interpolate entry from the previous point if it exists
+                    if (i > 0 && pts[i - 1].x < chartLeft) {
+                        cg.moveTo(chartLeft, interpY(pts[i - 1], pts[i], chartLeft));
+                    } else {
+                        cg.moveTo(px, py);
+                    }
+                    glowStarted = true;
+                } else {
+                    cg.lineTo(Math.min(px, chartRight), py);
+                }
+                if (px > chartRight) break;
+            }
             cg.strokePath();
 
             // Core line: thin opaque foreground indicator line
             cg.lineStyle(2, C.ACCENT, 1);
             cg.beginPath();
-            this.history.forEach((pt, i) => {
-                const x = getX(pt.t);
-                const y = getY(pt.p);
-                if (i === 0) cg.moveTo(x, y);
-                else cg.lineTo(x, y);
-            });
+            let lineStarted = false;
+            let lastX = pts[pts.length - 1].x;
+            let lastY = pts[pts.length - 1].y;
+            for (let i = 0; i < pts.length; i++) {
+                const px = pts[i].x;
+                const py = pts[i].y;
+                if (px < chartLeft) continue;
+                if (!lineStarted) {
+                    if (i > 0 && pts[i - 1].x < chartLeft) {
+                        cg.moveTo(chartLeft, interpY(pts[i - 1], pts[i], chartLeft));
+                    } else {
+                        cg.moveTo(px, py);
+                    }
+                    lineStarted = true;
+                } else {
+                    cg.lineTo(Math.min(px, chartRight), py);
+                }
+                if (px > chartRight) break;
+            }
             cg.strokePath();
 
             // Glowing indicator dot: renders current price coordinates at the head of the graph
@@ -537,7 +707,7 @@ export class Game extends Scene {
             this.balance -= betAmount;
             // Push active bet coordinates so it gets rendered on future frame updates
             this.bets.push({ t, p, amount: betAmount });
-            
+
             // Update balance display in top UI bar if widget reference is defined
             if (this._balanceText) {
                 this._balanceText.setText(`$${this.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`);
