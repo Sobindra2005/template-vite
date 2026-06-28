@@ -572,22 +572,72 @@ export class Game extends Scene {
         // 3. DRAW THE CHART LINE & SHADING
         if (this.history.length > 0) {
             let lastX = 0, lastY = 0;
-            let firstX = getX(this.history[0].t);
 
-            // Shading: Draw filled polygon under the line graph
-            cg.beginPath();
-            cg.moveTo(firstX, b.y + b.h); // Bottom anchor at first point
-            this.history.forEach((pt) => {
-                const x = getX(pt.t);
-                const y = getY(pt.p);
-                cg.lineTo(x, y);
-                lastX = x;
-                lastY = y;
-            });
-            cg.lineTo(lastX, b.y + b.h); // Bottom anchor at last point
-            cg.closePath();
-            cg.fillStyle(C.ACCENT, 0.08); // Semi-transparent blue fill
-            cg.fillPath();
+            // ── Shading: viewport-clipped, y-clamped fill polygon ──────────────
+            // Anchoring the fill at history[0]'s raw x causes a diagonal artifact
+            // when the first point is far off the left edge. Scrolling past the
+            // top/bottom edge causes a funnel artifact. Both are fixed below.
+            {
+                const chartLeft   = b.x;
+                const chartRight  = b.x + b.w;
+                const chartBottom = b.y + b.h;
+
+                // Build screen-space points (for shading only; lines use their own loops)
+                const pts = this.history.map(pt => ({ x: getX(pt.t), y: getY(pt.p) }));
+
+                // Track the true last point so the dot + label below still work
+                lastX = pts[pts.length - 1].x;
+                lastY = pts[pts.length - 1].y;
+
+                // Find the index of the last point still LEFT of the left edge
+                // (so we can interpolate the precise entry crossing)
+                let startIdx = 0;
+                for (let i = 0; i < pts.length - 1; i++) {
+                    if (pts[i + 1].x >= chartLeft) { startIdx = i; break; }
+                }
+                // Find the index of the first point still RIGHT of the right edge
+                let endIdx = pts.length - 1;
+                for (let i = pts.length - 1; i > 0; i--) {
+                    if (pts[i - 1].x <= chartRight) { endIdx = i; break; }
+                }
+
+                // Linear interpolation of Y at a target X between two points
+                const interpY = (p0, p1, tx) => {
+                    if (p1.x === p0.x) return p0.y;
+                    return p0.y + ((tx - p0.x) / (p1.x - p0.x)) * (p1.y - p0.y);
+                };
+
+                // Clamp Y so no fill vertex escapes the chart area.
+                // Points above b.y collapse to b.y; points below chartBottom collapse
+                // to chartBottom — preventing the V/funnel artifact on vertical scroll.
+                const clampY = (y) => Math.max(b.y, Math.min(chartBottom, y));
+
+                // Interpolate exact edge-crossing Y values
+                const entryX = Math.max(chartLeft, pts[startIdx].x);
+                const entryY = (pts[startIdx].x < chartLeft && startIdx + 1 <= endIdx)
+                    ? interpY(pts[startIdx], pts[startIdx + 1], chartLeft)
+                    : pts[startIdx].y;
+
+                const exitX = Math.min(chartRight, pts[endIdx].x);
+                const exitY = (pts[endIdx].x > chartRight && endIdx - 1 >= startIdx)
+                    ? interpY(pts[endIdx - 1], pts[endIdx], chartRight)
+                    : pts[endIdx].y;
+
+                // Draw the fill polygon over the visible segment only
+                cg.beginPath();
+                cg.moveTo(entryX, chartBottom);         // bottom-left anchor
+                cg.lineTo(entryX, clampY(entryY));      // rise to clamped line entry
+                for (let i = startIdx + 1; i <= endIdx; i++) {
+                    const px = Math.min(pts[i].x, chartRight);
+                    const py = pts[i].x > chartRight ? exitY : pts[i].y;
+                    cg.lineTo(px, clampY(py));
+                    if (pts[i].x >= chartRight) break;
+                }
+                cg.lineTo(exitX, chartBottom);          // bottom-right anchor
+                cg.closePath();
+                cg.fillStyle(C.ACCENT, 0.08);
+                cg.fillPath();
+            }
 
             // Glow line: thick semi-transparent backing line simulating a neon tube glow
             cg.lineStyle(8, C.ACCENT, 0.15);
