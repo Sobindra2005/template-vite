@@ -571,113 +571,44 @@ export class Game extends Scene {
 
         // 3. DRAW THE CHART LINE & SHADING
         if (this.history.length > 0) {
-            const chartLeft  = b.x;
-            const chartRight = b.x + b.w;
-            const chartBottom = b.y + b.h;
+            let lastX = 0, lastY = 0;
+            let firstX = getX(this.history[0].t);
 
-            // Build the list of screen-space points for all history entries
-            const pts = this.history.map(pt => ({ x: getX(pt.t), y: getY(pt.p) }));
-
-            // Find the first point that is at or just before the left edge of the viewport,
-            // and the last point that is at or just after the right edge.
-            // This lets us interpolate the exact x-edge crossings so the fill polygon
-            // never anchors far off-screen (which caused the diagonal triangular glitch).
-            let startIdx = 0;
-            for (let i = 0; i < pts.length - 1; i++) {
-                if (pts[i + 1].x >= chartLeft) { startIdx = i; break; }
-            }
-            let endIdx = pts.length - 1;
-            for (let i = pts.length - 1; i > 0; i--) {
-                if (pts[i - 1].x <= chartRight) { endIdx = i; break; }
-            }
-
-            // Helper: linearly interpolate y at a given x between two points
-            const interpY = (p0, p1, targetX) => {
-                if (p1.x === p0.x) return p0.y;
-                const t = (targetX - p0.x) / (p1.x - p0.x);
-                return p0.y + t * (p1.y - p0.y);
-            };
-
-            // Clamp y so fill polygon vertices never escape the chart bounds.
-            // Without this, points that are scrolled off the top or bottom of the screen
-            // produce V-shaped / funnel fill artifacts because the polygon bottom anchors
-            // are always at chartBottom while mid-curve vertices can be outside the canvas.
-            const clampY = (y) => Math.max(b.y, Math.min(chartBottom, y));
-
-            // Clip entry point: interpolate where the line crosses the left viewport edge
-            const entryX = Math.max(chartLeft, pts[startIdx].x);
-            const entryY = (pts[startIdx].x < chartLeft && startIdx + 1 <= endIdx)
-                ? interpY(pts[startIdx], pts[startIdx + 1], chartLeft)
-                : pts[startIdx].y;
-
-            // Clip exit point: interpolate where the line crosses the right viewport edge
-            const exitX  = Math.min(chartRight, pts[endIdx].x);
-            const exitY  = (pts[endIdx].x > chartRight && endIdx - 1 >= startIdx)
-                ? interpY(pts[endIdx - 1], pts[endIdx], chartRight)
-                : pts[endIdx].y;
-
-            // Shading: Draw filled polygon under the visible segment of the line graph.
-            // All y-values are clamped to [b.y, chartBottom] so the polygon never creates
-            // diagonal artifacts when the curve is scrolled past the top or bottom edge.
+            // Shading: Draw filled polygon under the line graph
             cg.beginPath();
-            cg.moveTo(entryX, chartBottom);              // bottom-left anchor
-            cg.lineTo(entryX, clampY(entryY));           // up to clamped line entry
-            for (let i = startIdx + 1; i <= endIdx; i++) {
-                const px = Math.min(pts[i].x, chartRight);
-                const py = (pts[i].x > chartRight) ? exitY : pts[i].y;
-                cg.lineTo(px, clampY(py));               // follow curve, y clamped
-                if (pts[i].x >= chartRight) break;
-            }
-            cg.lineTo(exitX, chartBottom);               // bottom-right anchor
+            cg.moveTo(firstX, b.y + b.h); // Bottom anchor at first point
+            this.history.forEach((pt) => {
+                const x = getX(pt.t);
+                const y = getY(pt.p);
+                cg.lineTo(x, y);
+                lastX = x;
+                lastY = y;
+            });
+            cg.lineTo(lastX, b.y + b.h); // Bottom anchor at last point
             cg.closePath();
-            cg.fillStyle(C.ACCENT, 0.08);
+            cg.fillStyle(C.ACCENT, 0.08); // Semi-transparent blue fill
             cg.fillPath();
 
             // Glow line: thick semi-transparent backing line simulating a neon tube glow
             cg.lineStyle(8, C.ACCENT, 0.15);
             cg.beginPath();
-            let glowStarted = false;
-            for (let i = 0; i < pts.length; i++) {
-                const px = pts[i].x;
-                const py = pts[i].y;
-                if (px < chartLeft) continue;
-                if (!glowStarted) {
-                    // Interpolate entry from the previous point if it exists
-                    if (i > 0 && pts[i - 1].x < chartLeft) {
-                        cg.moveTo(chartLeft, interpY(pts[i - 1], pts[i], chartLeft));
-                    } else {
-                        cg.moveTo(px, py);
-                    }
-                    glowStarted = true;
-                } else {
-                    cg.lineTo(Math.min(px, chartRight), py);
-                }
-                if (px > chartRight) break;
-            }
+            this.history.forEach((pt, i) => {
+                const x = getX(pt.t);
+                const y = getY(pt.p);
+                if (i === 0) cg.moveTo(x, y);
+                else cg.lineTo(x, y);
+            });
             cg.strokePath();
 
             // Core line: thin opaque foreground indicator line
             cg.lineStyle(2, C.ACCENT, 1);
             cg.beginPath();
-            let lineStarted = false;
-            let lastX = pts[pts.length - 1].x;
-            let lastY = pts[pts.length - 1].y;
-            for (let i = 0; i < pts.length; i++) {
-                const px = pts[i].x;
-                const py = pts[i].y;
-                if (px < chartLeft) continue;
-                if (!lineStarted) {
-                    if (i > 0 && pts[i - 1].x < chartLeft) {
-                        cg.moveTo(chartLeft, interpY(pts[i - 1], pts[i], chartLeft));
-                    } else {
-                        cg.moveTo(px, py);
-                    }
-                    lineStarted = true;
-                } else {
-                    cg.lineTo(Math.min(px, chartRight), py);
-                }
-                if (px > chartRight) break;
-            }
+            this.history.forEach((pt, i) => {
+                const x = getX(pt.t);
+                const y = getY(pt.p);
+                if (i === 0) cg.moveTo(x, y);
+                else cg.lineTo(x, y);
+            });
             cg.strokePath();
 
             // Glowing indicator dot: renders current price coordinates at the head of the graph
